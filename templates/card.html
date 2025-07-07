@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pet Information</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .card { background-color: white; border-radius: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 400px; width: 100%; overflow: hidden; }
+        .photo { width: 100%; height: 300px; object-fit: cover; }
+        .info { padding: 20px; }
+        h1 { margin: 0 0 10px; font-size: 24px; }
+        p { margin: 5px 0; color: #555; }
+        .status { margin-top: 15px; padding: 10px; border-radius: 8px; text-align: center; }
+        .safe { background-color: #e8f5e9; color: #2e7d32; }
+        .lost { background-color: #ffebee; color: #c62828; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <img src="{{ pet.photo_url }}" alt="Photo of {{ pet.name }}" class="photo">
+        <div class="info">
+            <h1>{{ pet.name }}</h1>
+            <p><strong>Species:</strong> {{ pet.species }}</p>
+            <p><strong>Breed:</strong> {{ pet.breed }}</p>
+            <p><strong>Owner:</strong> {{ owner.full_name }}</p>
+            <div id="status-message" class="status">Requesting location to notify owner...</div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(sendLocation, handleLocationError, { enableHighAccuracy: true });
+            } else {
+                document.getElementById('status-message').textContent = 'Geolocation is not supported by this browser.';
+                document.getElementById('status-message').className = 'status lost';
+            }
+        });
+
+        function sendLocation(position) {
+            const { latitude, longitude } = position.coords;
+            const petId = "{{ pet.id }}";
+
+            fetch(`/pet/${petId}/location`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ latitude, longitude }),
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    document.getElementById('status-message').textContent = 'Owner has been notified of this location.';
+                    document.getElementById('status-message').className = 'status safe';
+                } else {
+                    throw new Error(data.message || 'Failed to send location.');
+                }
+            })
+            .catch(error => {
+                console.error('Error sending location:', error);
+                document.getElementById('status-message').textContent = 'Could not send location to owner.';
+                document.getElementById('status-message').className = 'status lost';
+            });
+        }
+
+        function handleLocationError(error) {
+            let message = 'An unknown error occurred.';
+            switch(error.code) {
+                case error.PERMISSION_DENIED:
+                    message = "Location access denied. Please enable location services.";
+                    break;
+                case error.POSITION_UNAVAILABLE:
+                    message = "Location information is unavailable.";
+                    break;
+                case error.TIMEOUT:
+                    message = "The request to get user location timed out.";
+                    break;
+            }
+            document.getElementById('status-message').textContent = message;
+            document.getElementById('status-message').className = 'status lost';
+        }
+    </script>
+</body>
+</html>
