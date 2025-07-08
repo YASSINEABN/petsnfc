@@ -15,13 +15,14 @@ import io
 import base64
 from dotenv import load_dotenv
 import datetime
+import jwt
 from functools import wraps
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__, template_folder='templates')
-CORS(app, origins=["http://localhost:8081", "http://localhost:8082"], supports_credentials=True) # Allow both web and mobile dev servers
+CORS(app, origins=["https://petsnfc.onrender.com", "http://localhost:8081", "http://localhost:8082"], supports_credentials=True) # Allow deployment and dev servers
 
 @app.before_request
 def log_request_info():
@@ -60,7 +61,7 @@ def pet_card(pet_id):
             record = cur.fetchone()
             
             if record:
-                base_url = request.host_url.rstrip('/')
+                base_url = "https://petsnfc.onrender.com"
                 # Use the photo_url from the DB, or a placeholder if it's missing
                 relative_photo_url = record[4] if record[4] else '/uploads/pets/placeholder.svg'
                 
@@ -116,8 +117,12 @@ def get_db_connection():
     """Establishes a connection to the NeonDB database using the connection URL."""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable not set.")
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        return None
 
 def get_user_by_cin(cin):
     """Fetches a user from the database by their CIN."""
@@ -216,6 +221,21 @@ def create_locations_table():
 
 # Call this function at startup to ensure the table exists
 create_locations_table()
+
+# Check Tesseract availability at startup
+def check_tesseract():
+    """Check if Tesseract is available and log the version."""
+    try:
+        version = pytesseract.get_tesseract_version()
+        print(f"Tesseract version: {version}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Tesseract not available: {e}")
+        print("OCR functionality will not work. Install Tesseract using render-build.sh")
+        return False
+
+# Check Tesseract at startup
+tesseract_available = check_tesseract()
 
 @app.route('/pet/<int:pet_id>/location', methods=['POST'])
 def add_pet_location(pet_id):
@@ -447,64 +467,118 @@ class MRZParser:
 
 @app.route('/ocr', methods=['POST'])
 def ocr_handler():
+    """Handles OCR processing for ID card authentication."""
+    print(f"OCR request received: {request.content_type}")
+    
     if 'file' not in request.files:
+        print("No file part in request")
         return jsonify({'status': 'error', 'message': 'No file part in the request.'}), 400
+    
     file = request.files['file']
     if file.filename == '':
+        print("No file selected")
         return jsonify({'status': 'error', 'message': 'No file selected.'}), 400
 
     try:
+        # Check if Tesseract is available
+        if not tesseract_available:
+            return jsonify({
+                'status': 'error', 
+                'message': 'OCR service not available. Please contact support.'
+            }), 500
+
+        # Process the image
         in_memory_file = io.BytesIO()
         file.save(in_memory_file)
         in_memory_file.seek(0)
-        image = Image.open(in_memory_file)
-        image_np = np.array(image)
-        processed_image = preprocess_for_ocr(image_np)
-        ocr_text = pytesseract.image_to_string(processed_image)
-        mrz_data = MRZParser.parse(ocr_text)
-        if 'Error' in mrz_data:
-            return jsonify({'status': 'error', 'message': mrz_data['Error']}), 400
+        
+        try:
+            image = Image.open(in_memory_file)
+            image_np = np.array(image)
+        except Exception as img_error:
+            print(f"Image processing error: {img_error}")
+            return jsonify({'status': 'error', 'message': 'Invalid image format.'}), 400
+        
+        # Preprocess and OCR
+        try:
+            processed_image = preprocess_for_ocr(image_np)
+            ocr_text = pytesseract.image_to_string(processed_image)
+            print(f"OCR text extracted: {ocr_text[:100]}...")  # Log first 100 chars
+        except Exception as ocr_error:
+            print(f"OCR processing error: {ocr_error}")
+            return jsonify({'status': 'error', 'message': 'Failed to process image with OCR.'}), 500
+        
+        # Parse MRZ data
+        try:
+            mrz_data = MRZParser.parse(ocr_text)
+            if 'Error' in mrz_data:
+                print(f"MRZ parsing error: {mrz_data['Error']}")
+                return jsonify({'status': 'error', 'message': mrz_data['Error']}), 400
+        except Exception as mrz_error:
+            print(f"MRZ parsing error: {mrz_error}")
+            return jsonify({'status': 'error', 'message': 'Failed to parse ID card data.'}), 400
+        
+        # Extract CIN and handle user creation/authentication
         if 'CIN' in mrz_data or 'cin' in mrz_data:
             cin = mrz_data.get('CIN') or mrz_data.get('cin')
             name = None
             if 'firstname' in mrz_data and 'lastname' in mrz_data:
                 name = f"{mrz_data['firstname']} {mrz_data['lastname']}"
-            user, db_error = get_user_by_cin(cin)
-            if db_error:
-                return jsonify({'status': 'error', 'message': f'Database error: {db_error}'}), 500
-            if user:
-                return jsonify({'status': 'success', 'user': user})
-            else:
-                # User not found - create a new user with extracted CIN and name
-                conn = get_db_connection()
-                if conn is None:
-                    return jsonify({'status': 'error', 'message': 'Database connection failed when trying to create new user'}), 500
-                try:
-                    with conn.cursor() as cur:
-                        default_name = name if name else f"User {cin}"
-                        cur.execute(
-                            "INSERT INTO users (cin, full_name, created_at) VALUES (%s, %s, NOW()) RETURNING id, cin, full_name;",
-                            (cin, default_name)
-                        )
-                        new_user = cur.fetchone()
-                        conn.commit()
-                        if new_user:
-                            new_user_data = {'id': new_user[0], 'cin': new_user[1], 'full_name': new_user[2]}
-                            return jsonify({
-                                'status': 'success',
-                                'user': new_user_data,
-                                'message': 'New user created from ID card information.'
-                            })
-                        else:
-                            return jsonify({'status': 'error', 'message': 'Failed to create user from ID card.'}), 500
-                except Exception as e:
-                    conn.rollback()
-                    return jsonify({'status': 'error', 'message': f'Error creating new user: {str(e)}'}), 500
-                finally:
-                    conn.close()
+            
+            print(f"Extracted CIN: {cin}, Name: {name}")
+            
+            try:
+                user, db_error = get_user_by_cin(cin)
+                if db_error:
+                    print(f"Database error during user lookup: {db_error}")
+                    return jsonify({'status': 'error', 'message': f'Database error: {db_error}'}), 500
+                
+                if user:
+                    print(f"Existing user found: {user}")
+                    return jsonify({'status': 'success', 'user': user})
+                else:
+                    # Create new user
+                    print(f"Creating new user with CIN: {cin}")
+                    conn = get_db_connection()
+                    if conn is None:
+                        return jsonify({'status': 'error', 'message': 'Database connection failed when trying to create new user'}), 500
+                    
+                    try:
+                        with conn.cursor() as cur:
+                            default_name = name if name else f"User {cin}"
+                            cur.execute(
+                                "INSERT INTO users (cin, full_name, created_at) VALUES (%s, %s, NOW()) RETURNING id, cin, full_name;",
+                                (cin, default_name)
+                            )
+                            new_user = cur.fetchone()
+                            conn.commit()
+                            if new_user:
+                                new_user_data = {'id': new_user[0], 'cin': new_user[1], 'full_name': new_user[2]}
+                                print(f"New user created: {new_user_data}")
+                                return jsonify({
+                                    'status': 'success',
+                                    'user': new_user_data,
+                                    'message': 'New user created from ID card information.'
+                                })
+                            else:
+                                return jsonify({'status': 'error', 'message': 'Failed to create user from ID card.'}), 500
+                    except Exception as create_error:
+                        conn.rollback()
+                        print(f"Error creating new user: {create_error}")
+                        return jsonify({'status': 'error', 'message': f'Error creating new user: {str(create_error)}'}), 500
+                    finally:
+                        conn.close()
+            except Exception as auth_error:
+                print(f"Authentication error: {auth_error}")
+                return jsonify({'status': 'error', 'message': f'Authentication error: {str(auth_error)}'}), 500
         else:
+            print("No CIN found in MRZ data")
             return jsonify({'status': 'error', 'message': 'Failed to extract CIN from ID.'}), 400
+            
     except Exception as e:
+        print(f"Unexpected error in OCR handler: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'status': 'error', 'message': f'An unexpected error occurred: {str(e)}'}), 500
 
 @app.route('/user/<int:user_id>/pets', methods=['GET', 'POST'])
@@ -1380,4 +1454,4 @@ def uploaded_file(filename):
     return send_from_directory(uploads_dir, filename)
 
 if __name__ == '__main__':
-    app.run(port=5002, debug=False, use_reloader=False)
+    app.run(port=5002, debug=True, use_reloader=False)
