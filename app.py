@@ -5,7 +5,7 @@ import json
 import re
 import numpy as np
 import cv2
-import pytesseract
+import easyocr
 from PIL import Image
 from flask import Flask, request, jsonify, send_from_directory, render_template
 from werkzeug.utils import secure_filename
@@ -22,6 +22,15 @@ load_dotenv()
 
 app = Flask(__name__, template_folder='templates')
 CORS(app, origins=["https://petsnfc.onrender.com", "http://localhost:8081", "http://localhost:8082"], supports_credentials=True) # Allow deployment and dev servers
+
+# Initialize EasyOCR reader (will download models on first use)
+print("Initializing EasyOCR...")
+try:
+    reader = easyocr.Reader(['en', 'ar'], gpu=False)  # Support English and Arabic
+    print("EasyOCR initialized successfully")
+except Exception as e:
+    print(f"Warning: EasyOCR initialization failed: {e}")
+    reader = None
 
 @app.before_request
 def log_request_info():
@@ -204,7 +213,7 @@ def create_locations_table():
                 CREATE TABLE IF NOT EXISTS locations (
                     id SERIAL PRIMARY KEY,
                     pet_id INTEGER NOT NULL,
-                     DECIMAL(9, 6) NOT NULL,
+                    latitude DECIMAL(9, 6) NOT NULL,
                     longitude DECIMAL(9, 6) NOT NULL,
                     timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (pet_id) REFERENCES animals (id) ON DELETE CASCADE
@@ -220,21 +229,6 @@ def create_locations_table():
 
 # Call this function at startup to ensure the table exists
 create_locations_table()
-
-# Check Tesseract availability at startup
-def check_tesseract():
-    """Check if Tesseract is available and log the version."""
-    try:
-        version = pytesseract.get_tesseract_version()
-        print(f"Tesseract version: {version}")
-        return True
-    except Exception as e:
-        print(f"WARNING: Tesseract not available: {e}")
-        print("OCR functionality will not work. Install Tesseract using render-build.sh")
-        return False
-
-# Check Tesseract at startup
-tesseract_available = check_tesseract()
 
 @app.route('/pet/<int:pet_id>/location', methods=['POST'])
 def add_pet_location(pet_id):
@@ -479,13 +473,6 @@ def ocr_handler():
         return jsonify({'status': 'error', 'message': 'No file selected.'}), 400
 
     try:
-        # Check if Tesseract is available
-        if not tesseract_available:
-            return jsonify({
-                'status': 'error', 
-                'message': 'OCR service not available. Please contact support.'
-            }), 500
-
         # Process the image
         in_memory_file = io.BytesIO()
         file.save(in_memory_file)
@@ -501,7 +488,13 @@ def ocr_handler():
         # Preprocess and OCR
         try:
             processed_image = preprocess_for_ocr(image_np)
-            ocr_text = pytesseract.image_to_string(processed_image)
+            if reader is None:
+                return jsonify({'status': 'error', 'message': 'OCR service not available. Please enter your CIN manually.'}), 503
+            
+            # EasyOCR returns list of (bbox, text, confidence)
+            ocr_results = reader.readtext(processed_image)
+            # Extract just the text from results
+            ocr_text = '\n'.join([result[1] for result in ocr_results])
             print(f"OCR text extracted: {ocr_text[:100]}...")  # Log first 100 chars
         except Exception as ocr_error:
             print(f"OCR processing error: {ocr_error}")
