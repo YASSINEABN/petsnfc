@@ -19,7 +19,9 @@ from functools import wraps
 
 # Load environment variables from .env file
 load_dotenv()
+
 app = Flask(__name__, template_folder='templates')
+# Update CORS to allow requests from your frontend
 CORS(app, origins=[
     "http://10.224.2.149:8081",
     "http://localhost:8081",
@@ -30,6 +32,7 @@ CORS(app, origins=[
     "https://petsnfc.onrender.com",
     "*"
 ], supports_credentials=True, allow_headers="*")
+
 @app.before_request
 def log_request_info():
     # Log all requests for debugging
@@ -67,7 +70,7 @@ def pet_card(pet_id):
             record = cur.fetchone()
             
             if record:
-                base_url = request.host_url.rstrip('/')
+                base_url = "https://petsnfc.onrender.com"
                 # Use the photo_url from the DB, or a placeholder if it's missing
                 relative_photo_url = record[4] if record[4] else '/uploads/pets/placeholder.svg'
                 
@@ -98,7 +101,6 @@ def pet_card(pet_id):
             
     return render_template('card.html', pet=pet, owner=owner)
 
-
 # Environment variables
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -123,8 +125,12 @@ def get_db_connection():
     """Establishes a connection to the NeonDB database using the connection URL."""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable not set.")
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        return None
 
 def get_user_by_cin(cin):
     """Fetches a user from the database by their CIN."""
@@ -207,7 +213,7 @@ def create_locations_table():
                 CREATE TABLE IF NOT EXISTS locations (
                     id SERIAL PRIMARY KEY,
                     pet_id INTEGER NOT NULL,
-                     DECIMAL(9, 6) NOT NULL,
+                    latitude DECIMAL(9, 6) NOT NULL,
                     longitude DECIMAL(9, 6) NOT NULL,
                     timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (pet_id) REFERENCES animals (id) ON DELETE CASCADE
@@ -222,7 +228,22 @@ def create_locations_table():
             conn.close()
 
 # Call this function at startup to ensure the table exists
-create_locations_table()
+
+
+# Check Tesseract availability at startup
+def check_tesseract():
+    """Check if Tesseract is available and log the version."""
+    try:
+        version = pytesseract.get_tesseract_version()
+        print(f"Tesseract version: {version}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Tesseract not available: {e}")
+        print("OCR functionality will not work. Install Tesseract using render-build.sh")
+        return False
+
+# Check Tesseract at startup
+tesseract_available = check_tesseract()
 
 @app.route('/pet/<int:pet_id>/location', methods=['POST'])
 def add_pet_location(pet_id):
@@ -280,38 +301,18 @@ def get_pet_location(pet_id):
 
 @app.route('/login', methods=['POST'])
 def login():
-    """Authenticates a user by CIN and returns user info. If CIN not found, create a new user. JWT is not returned."""
+    """Authenticates a user by CIN and returns user info. If CIN not found, add to users.json and authenticate."""
     data = request.get_json()
     if not data or 'cin' not in data:
         return jsonify({'status': 'error', 'message': 'CIN is required for login.'}), 400
     cin = data['cin']
-    user, error = get_user_by_cin(cin)
+    user, error = get_user_by_cin_json(cin)
     if error:
-        return jsonify({'status': 'error', 'message': 'Database error: ' + error}), 500
+        return jsonify({'status': 'error', 'message': 'Error: ' + error}), 500
     if not user:
-        # Create new user with default name
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({'status': 'error', 'message': 'Database connection failed when trying to create new user'}), 500
-        try:
-            with conn.cursor() as cur:
-                default_name = f"User {cin}"
-                cur.execute(
-                    "INSERT INTO users (cin, full_name, created_at) VALUES (%s, %s, NOW()) RETURNING id, cin, full_name;",
-                    (cin, default_name)
-                )
-                new_user = cur.fetchone()
-                conn.commit()
-                if new_user:
-                    user = {'id': new_user[0], 'cin': new_user[1], 'full_name': new_user[2]}
-                else:
-                    return jsonify({'status': 'error', 'message': 'Failed to create user from CIN.'}), 500
-        except Exception as e:
-            conn.rollback()
-            return jsonify({'status': 'error', 'message': f'Error creating new user: {str(e)}'}), 500
-        finally:
-            conn.close()
-    # No JWT, just return user info
+        # Add new user to users.json
+        full_name = data.get('full_name') or f'User {cin}'
+        user = add_user_to_json(cin, full_name)
     return jsonify({'status': 'success', 'user': user})
 
 def get_current_user_id_from_token():
@@ -323,9 +324,9 @@ def get_current_user_id_from_token():
     try:
         # Expecting "Bearer <token>"
         token = auth_header.split(" ")[1]
-        decoded_token = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return decoded_token.get('user_id')
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, IndexError):
+        # JWT functionality removed - return None for now
+        return None
+    except (Exception, IndexError):
         return None
 
 
@@ -452,66 +453,121 @@ class MRZParser:
 
         return parsed_data
 
+def load_users():
+    """Loads users from the users.json file."""
+    try:
+        with open('users.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+def get_user_by_cin_json(cin):
+    """Fetches a user from users.json by their CIN."""
+    users = load_users()
+    for user in users:
+        if user.get('cin') == cin:
+            return user, None
+    return None, "User not found in users.json."
+
+def add_user_to_json(cin, full_name):
+    """Adds a new user to users.json."""
+    users = load_users()
+    new_id = get_next_user_id()
+    new_user = {"cin": cin, "full_name": full_name, "id": new_id}
+    users.append(new_user)
+    with open('users.json', 'w', encoding='utf-8') as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+    return new_user
+
+def get_next_user_id():
+    users = load_users()
+    if not users:
+        return 1
+    max_id = max((u.get('id', 0) for u in users), default=0)
+    return max_id + 1
+
+def add_user_to_json_with_id(cin, full_name):
+    users = load_users()
+    new_id = get_next_user_id()
+    new_user = {"cin": cin, "full_name": full_name, "id": new_id}
+    users.append(new_user)
+    with open('users.json', 'w', encoding='utf-8') as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+    return new_user
+
 @app.route('/ocr', methods=['POST'])
 def ocr_handler():
+    """Handles OCR processing for ID card authentication."""
+    print(f"OCR request received: {request.content_type}")
+    # Check if Tesseract is available
+    if not tesseract_available:
+        return jsonify({
+            'status': 'error', 
+            'message': 'OCR service not available. Please enter your CIN manually in the login screen.',
+            'fallback_available': True
+        }), 503
     if 'file' not in request.files:
+        print("No file part in request")
         return jsonify({'status': 'error', 'message': 'No file part in the request.'}), 400
     file = request.files['file']
     if file.filename == '':
+        print("No file selected")
         return jsonify({'status': 'error', 'message': 'No file selected.'}), 400
-
     try:
+        # Process the image
         in_memory_file = io.BytesIO()
         file.save(in_memory_file)
         in_memory_file.seek(0)
-        image = Image.open(in_memory_file)
-        image_np = np.array(image)
-        processed_image = preprocess_for_ocr(image_np)
-        ocr_text = pytesseract.image_to_string(processed_image)
-        mrz_data = MRZParser.parse(ocr_text)
-        if 'Error' in mrz_data:
-            return jsonify({'status': 'error', 'message': mrz_data['Error']}), 400
+        try:
+            image = Image.open(in_memory_file)
+            image_np = np.array(image)
+        except Exception as img_error:
+            print(f"Image processing error: {img_error}")
+            return jsonify({'status': 'error', 'message': 'Invalid image format.'}), 400
+        # Preprocess and OCR
+        try:
+            processed_image = preprocess_for_ocr(image_np)
+            ocr_text = pytesseract.image_to_string(processed_image, lang='ara+eng')
+            print(f"OCR text extracted: {ocr_text[:100]}...")  # Log first 100 chars
+        except Exception as ocr_error:
+            print(f"OCR processing error: {ocr_error}")
+            return jsonify({'status': 'error', 'message': 'Failed to process image with OCR.'}), 500
+        # Parse MRZ data
+        try:
+            mrz_data = MRZParser.parse(ocr_text)
+            if 'Error' in mrz_data:
+                print(f"MRZ parsing error: {mrz_data['Error']}")
+                return jsonify({'status': 'error', 'message': mrz_data['Error']}), 400
+        except Exception as mrz_error:
+            print(f"MRZ parsing error: {mrz_error}")
+            return jsonify({'status': 'error', 'message': 'Failed to parse ID card data.'}), 400
+        # Extract CIN and handle user authentication
         if 'CIN' in mrz_data or 'cin' in mrz_data:
             cin = mrz_data.get('CIN') or mrz_data.get('cin')
             name = None
             if 'firstname' in mrz_data and 'lastname' in mrz_data:
                 name = f"{mrz_data['firstname']} {mrz_data['lastname']}"
-            user, db_error = get_user_by_cin(cin)
-            if db_error:
-                return jsonify({'status': 'error', 'message': f'Database error: {db_error}'}), 500
+            print(f"Extracted CIN: {cin}, Name: {name}")
+            user, error = get_user_by_cin_json(cin)
+            if error:
+                print(f"Error during user lookup: {error}")
+                return jsonify({'status': 'error', 'message': f'Error: {error}'}), 500
             if user:
+                print(f"Existing user found: {user}")
                 return jsonify({'status': 'success', 'user': user})
             else:
-                # User not found - create a new user with extracted CIN and name
-                conn = get_db_connection()
-                if conn is None:
-                    return jsonify({'status': 'error', 'message': 'Database connection failed when trying to create new user'}), 500
-                try:
-                    with conn.cursor() as cur:
-                        default_name = name if name else f"User {cin}"
-                        cur.execute(
-                            "INSERT INTO users (cin, full_name, created_at) VALUES (%s, %s, NOW()) RETURNING id, cin, full_name;",
-                            (cin, default_name)
-                        )
-                        new_user = cur.fetchone()
-                        conn.commit()
-                        if new_user:
-                            new_user_data = {'id': new_user[0], 'cin': new_user[1], 'full_name': new_user[2]}
-                            return jsonify({
-                                'status': 'success',
-                                'user': new_user_data,
-                                'message': 'New user created from ID card information.'
-                            })
-                        else:
-                            return jsonify({'status': 'error', 'message': 'Failed to create user from ID card.'}), 500
-                except Exception as e:
-                    conn.rollback()
-                    return jsonify({'status': 'error', 'message': f'Error creating new user: {str(e)}'}), 500
-                finally:
-                    conn.close()
+                # Add new user to users.json with id
+                full_name = name or f'User {cin}'
+                user = add_user_to_json_with_id(cin, full_name)
+                print(f"New user created: {user}")
+                return jsonify({'status': 'success', 'user': user, 'message': 'New user created from ID card information.'})
         else:
+            print("No CIN found in MRZ data")
             return jsonify({'status': 'error', 'message': 'Failed to extract CIN from ID.'}), 400
     except Exception as e:
+        print(f"Unexpected error in OCR handler: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'status': 'error', 'message': f'An unexpected error occurred: {str(e)}'}), 500
 
 @app.route('/user/<int:user_id>/pets', methods=['GET', 'POST'])
