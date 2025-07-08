@@ -15,7 +15,6 @@ import io
 import base64
 from dotenv import load_dotenv
 import datetime
-import jwt
 from functools import wraps
 
 # Load environment variables from .env file
